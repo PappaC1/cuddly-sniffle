@@ -26,98 +26,81 @@ def parse_computaform_pdf(uploaded_file) -> pd.DataFrame:
         course = cm.group(1).upper()
     going = "Polytrack" if "POLYTRACK" in "\n".join(pages_text[:4]).upper() else "Good"
 
-    # 1. Collect race metadata, jockeys, trainers, L3, MR, CForm & Speed from individual race pages
-    race_meta = {}
-    runner_extra = {}
-
+    runners = []
     for txt in pages_text:
-        if "Race Ref:" not in txt:
+        # Only process dedicated race card pages (skip index/stats/summary pages)
+        if "Race Ref:" not in txt or "CFORM RATINGS" not in txt:
             continue
+
+        # Race number sits right after race time (e.g. "11:40 1" or "12:15\n2")
         rm = re.search(r"\b\d{2}:\d{2}\s+(\d{1,2})\b", txt)
+        dm = re.search(r"\b(\d{3,4})m\b", txt)
         if not rm:
             continue
         r_num = int(rm.group(1))
-        dm = re.search(r"\b(\d{3,4})m\b", txt)
         dist = int(dm.group(1)) if dm else 1200
         r_type = "Maiden" if "MAIDEN" in txt.upper() else ("Plate" if "PLATE" in txt.upper() else "Handicap")
-        race_meta[r_num] = {"distance_m": dist, "race_type": r_type}
 
-        # Extract Fast Form ratings
+        # Extract Fast Form ratings on this race page
+        ratings = {}
         fb = re.search(r"CFORM RATINGS(.*?)TIPSTER", txt, re.S | re.I)
         if fb:
             for line in fb.group(1).split("\n"):
                 if "TOP %" in line or "BEST WEIGHTED" in line:
                     continue
                 for bm in re.finditer(r"\b(\d{1,2})\s+[A-Za-z][A-Za-z\s\'\(\)\-]+?\s+([+-]\d+\.\d+)\b", line):
-                    runner_extra.setdefault((r_num, int(bm.group(1))), {})["bva"] = float(bm.group(2))
+                    ratings.setdefault(int(bm.group(1)), {})["bva"] = float(bm.group(2))
                 for im in re.finditer(r"\b(\d{1,2})\s+[A-Za-z][A-Za-z\s\'\(\)\-]+?\s+(\d{1,3})\b", line):
                     no, val = int(im.group(1)), float(im.group(2))
-                    ent = runner_extra.setdefault((r_num, no), {})
+                    ent = ratings.setdefault(no, {})
                     if "cf" not in ent and val <= 75:
                         ent["cf"] = val
                     elif "sp" not in ent:
                         ent["sp"] = val
 
-        # Extract Trainer, Jockey, L3, Starts/Wins from summary rows
-        for line in txt.split("\n"):
-            m = re.search(r"^\s*(\d{1,2})\s+(?:([\d▲▼]+)\s+)?([A-Z][A-Z\s\'\(\)\-]+?)\s+(\d+)-(\d+)-(\d+)-(\d+)\s+\d+%.*?(\d{1,2})\s+([A-Za-z\s/\.\-]+?)\s+(?:[\d\.]+|--)\s*%\s+\*?([A-Za-z\s/\.\-]+?)\s+(?:[\d\.]+|--)\s*%", line)
-            if m:
-                no = int(m.group(1))
-                ent = runner_extra.setdefault((r_num, no), {})
-                ent["l3"] = ",".join(["99" if d == "0" else d for d in re.findall(r"\d", m.group(2) or "")[:3]])
-                ent["starts"] = int(m.group(4))
-                ent["wins"] = int(m.group(5))
-                ent["places"] = int(m.group(5)) + int(m.group(6)) + int(m.group(7))
-                ent["trainer"] = m.group(9).strip()
-                ent["jockey"] = m.group(10).strip()
+        # Isolate only the top runner table (between "No L3 Name" and "CFORM RATINGS")
+        table_match = re.search(r"No\s+L3\s+Name(.*?)CFORM RATINGS", txt, re.S | re.I)
+        table_block = table_match.group(1) if table_match else txt
 
-    # 2. Parse Page 4 Master Fields Grid (1 - 1 HORSE NAME 52.5 ... 7/2)
-    runners = []
-    fields_page = next((p for p in pages_text if "FIELDS, RATINGS FOR" in p.upper()), "")
-    if fields_page:
-        # Split into race blocks using time + distance headers (e.g. "11:40 - R97,500 ... 1000m")
-        active_race = 1
-        for line in fields_page.split("\n"):
-            # Detect race number box or time line
-            time_m = re.search(r"\b(\d{2}:\d{2})\s*-\s*R[\d,]+.*?(\d{3,4})m\b", line)
-            if time_m:
-                # Match race number by time order or explicit number
-                t_str = time_m.group(1)
-                for r_idx, txt in enumerate(pages_text):
-                    if t_str in txt and "Race Ref:" in txt:
-                        rm = re.search(rf"{t_str}\s+(\d{{1,2}})\b", txt)
-                        if rm:
-                            active_race = int(rm.group(1))
-                            break
-                race_meta.setdefault(active_race, {})["distance_m"] = int(time_m.group(2))
+        for line in table_block.split("\n"):
+            # Flexible row matcher: starts with Saddle No, contains R-1-2-3 record, and ends with Fcst odds (e.g. 18-10 or 7/2)
+            m = re.search(
+                r"^\s*(\d{1,2})\s+(?:([\d▲▼]+)\s+)?([A-Z][A-Z\s\'\(\)\-]+?)\s+(\d+)-(\d+)-(\d+)-(\d+)\s+\d+%.*?(\d+[-/]\d+)\s*$",
+                line,
+            )
+            if not m:
                 continue
 
-            # Match runner line: "1 - 1 SPIRIT OF FUN 52.5 ... 7/2" or "6 6 SPOIL YOURSELF 59 ... 7/1"
-            rm_row = re.search(r"^\s*(\d{1,2})\s*[-–]?\s*(\d{1,2})\s+([A-Z][A-Z\s\'\(\)\-]+?)\s+([\d\.]+)\s+.*?(\d+/\d+)\s*$", line)
-            if rm_row:
-                no, draw = int(rm_row.group(1)), int(rm_row.group(2))
-                h_name = rm_row.group(3).strip().title()
-                wgt = float(rm_row.group(4))
-                num, den = map(float, rm_row.group(5).split("/"))
-                rmeta = race_meta.get(active_race, {})
-                extra = runner_extra.get((active_race, no), {})
-                runners.append({
-                    "race_id": f"{course[:3]}_R{active_race}", "course": course, "race_number": active_race,
-                    "distance_m": rmeta.get("distance_m", 1200), "going": going,
-                    "race_type": rmeta.get("race_type", "Handicap"),
-                    "saddle_number": no, "horse_name": h_name, "draw": draw, "weight_kg": wgt,
-                    "trainer_name": extra.get("trainer", "SA Trainer"),
-                    "jockey_name": extra.get("jockey", "SA Jockey"),
-                    "wins_last_12_months": extra.get("wins", 0),
-                    "places_last_12_months": extra.get("places", 0),
-                    "starts_last_12_months": extra.get("starts", 0),
-                    "last_3_positions": extra.get("l3", ""),
-                    "official_rating": np.nan,
-                    "market_odds": round((num / den) + 1.0, 2),
-                    "cform_rating": extra.get("cf", np.nan),
-                    "cf_speed_rating": extra.get("sp", np.nan),
-                    "best_vs_ave": extra.get("bva", np.nan),
-                })
+            no = int(m.group(1))
+            l3 = ",".join(["99" if d == "0" else d for d in re.findall(r"\d", m.group(2) or "")[:3]])
+            h_name = m.group(3).strip().title()
+            starts, wins, s2, s3 = int(m.group(4)), int(m.group(5)), int(m.group(6)), int(m.group(7))
+            num, den = map(float, m.group(8).replace("-", "/").split("/"))
+
+            # Extract Draw, Trainer & Jockey from the middle of the row if present
+            mid = line[m.end(7):m.start(8)]
+            conn_m = re.search(r"\b(\d{1,2})\s+([A-Za-z\s/\.\-]+?)\s+(?:[\d\.]+|--)\s*%\s+\*?([A-Za-z\s/\.\-]+?)\s+(?:[\d\.]+|--)\s*%", mid)
+            draw = int(conn_m.group(1)) if conn_m else no
+            trainer = conn_m.group(2).strip() if conn_m else "SA Trainer"
+            jockey = conn_m.group(3).strip() if conn_m else "SA Jockey"
+
+            # Extract CMR (Merit Rating) if present right after jockey %
+            mr_m = re.search(r"%\s+(?:\d{2,3}\s+)?(\d{2,3})\b", mid)
+            mr = float(mr_m.group(1)) if mr_m else np.nan
+
+            rmeta = ratings.get(no, {})
+            runners.append({
+                "race_id": f"{course[:3]}_R{r_num}", "course": course, "race_number": r_num,
+                "distance_m": dist, "going": going, "race_type": r_type,
+                "saddle_number": no, "horse_name": h_name, "draw": draw,
+                "trainer_name": trainer, "jockey_name": jockey,
+                "wins_last_12_months": wins, "places_last_12_months": wins + s2 + s3,
+                "starts_last_12_months": starts, "last_3_positions": l3,
+                "official_rating": mr, "market_odds": round((num / den) + 1.0, 2),
+                "cform_rating": rmeta.get("cf", np.nan),
+                "cf_speed_rating": rmeta.get("sp", np.nan),
+                "best_vs_ave": rmeta.get("bva", np.nan),
+            })
 
     df = pd.DataFrame(runners)
     return df.drop_duplicates(subset=["race_id", "saddle_number"]).sort_values(["race_number", "saddle_number"]) if not df.empty else df
@@ -128,7 +111,7 @@ def score_runners(today_df: pd.DataFrame) -> pd.DataFrame:
     for _, grp in df.groupby("race_id", sort=False):
         mkt = grp["implied_probability"].values / grp["implied_probability"].sum()
         z = np.zeros(len(grp))
-        for col, w in [("cform_rating", 0.35), ("cf_speed_rating", 0.25), ("recent_form_score", 0.15), ("best_vs_ave", 0.15), ("win_rate_12m", 0.10)]:
+        for col, w in [("cform_rating", 0.30), ("cf_speed_rating", 0.25), ("recent_form_score", 0.15), ("best_vs_ave", 0.15), ("official_rating", 0.10), ("win_rate_12m", 0.05)]:
             arr = grp[col].fillna(grp[col].median()).fillna(0).values
             if np.std(arr) > 0:
                 z += w * ((arr - np.mean(arr)) / np.std(arr))
@@ -156,7 +139,7 @@ course_title = str(first_val(today_df["course"]))
 
 tab1, tab2 = st.tabs(["🏆 Punters Challenge Card", "🔍 Race-by-Race"])
 with tab1:
-    st.subheader(f"{course_title} — Punters Card")
+    st.subheader(f"{course_title} — Punters Card ({today_df['race_number'].nunique()} Races)")
     best_picks = selection_df[selection_df["is_best_selection"]].sort_values("race_number")
     for _, pick in best_picks.iterrows():
         rm = predictions[(predictions["race_number"] == pick["race_number"]) & (predictions["horse_name"] == pick["horse_name"])]
@@ -178,3 +161,4 @@ with tab2:
             st.markdown(f"### {'🥇' if row['is_best_selection'] else '•'} {row['selection_type']}: **{row['horse_name']}**\nWin: **{row['model_win_probability']:.1%}** | Odds: **{row['market_odds']:.2f}** | Edge: **{row['model_edge']:+.1%}**")
     cols = ["saddle_number", "horse_name", "jockey_name", "draw", "cform_rating", "cf_speed_rating", "market_odds", "model_win_probability", "model_edge"]
     st.dataframe(r_sub[cols].sort_values("model_win_probability", ascending=False), use_container_width=True, hide_index=True)
+
