@@ -163,7 +163,7 @@ with tab1:
         saddle = int(first_val(rm["saddle_number"])) if not rm.empty else "-"
         jockey = str(first_val(rm["jockey_name"])) if not rm.empty else ""
         with st.container(border=True):
-            c1, c2 = st.columns()
+            c1, c2 = st.columns(2)
             c1.markdown(f"**R{int(pick['race_number'])}: #{saddle} {pick['horse_name']}**")
             c1.caption(f"{pick['selection_type']} • {jockey} • Fcst: {pick['market_odds']:.2f}")
             c2.metric("Win %", f"{pick['model_win_probability']:.0%}")
